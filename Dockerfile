@@ -1,77 +1,68 @@
-# pip dependencies install stage
+# Set Python version to 3.10 for compatibility with puppeteer.py
+ARG PYTHON_VERSION=3.10
 
-# @NOTE! I would love to move to 3.11 but it breaks the async handler in changedetectionio/content_fetchers/puppeteer.py
-#        If you know how to fix it, please do! and test it for both 3.10 and 3.11
-
-ARG PYTHON_VERSION=3.11
-
+# Base builder image
 FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
 
-# See `cryptography` pin comment in requirements.txt
+# Prevents Rust build issues when installing `cryptography`
 ARG CRYPTOGRAPHY_DONT_BUILD_RUST=1
 
+# Install necessary build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ \
-    gcc \
-    libc-dev \
-    libffi-dev \
-    libjpeg-dev \
-    libssl-dev \
-    libxslt-dev \
-    make \
-    zlib1g-dev
+    g++ gcc libc-dev libffi-dev \
+    libjpeg-dev libssl-dev libxslt-dev \
+    make zlib1g-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Create an installation directory
 RUN mkdir /install
 WORKDIR /install
 
+# Copy requirements
 COPY requirements.txt /requirements.txt
 
-# --extra-index-url https://www.piwheels.org/simple  is for cryptography module to be prebuilt (or rustc etc needs to be installed)
-RUN pip install --extra-index-url https://www.piwheels.org/simple  --target=/dependencies -r /requirements.txt
+# Install Python dependencies
+RUN pip install --extra-index-url https://www.piwheels.org/simple --target=/dependencies -r /requirements.txt
 
-# Playwright is an alternative to Selenium
-# Excluded this package from requirements.txt to prevent arm/v6 and arm/v7 builds from failing
-# https://github.com/dgtlmoon/changedetection.io/pull/1067 also musl/alpine (not supported)
-RUN pip install --target=/dependencies playwright~=1.48.0 \
-    || echo "WARN: Failed to install Playwright. The application can still run, but the Playwright option will be disabled."
+# Install Playwright separately to avoid issues on ARM devices
+RUN pip install --target=/dependencies playwright~=1.48.0 || \
+    echo "WARN: Failed to install Playwright. The application can still run, but Playwright will be disabled."
 
-# Final image stage
+# Final runtime image
 FROM python:${PYTHON_VERSION}-slim-bookworm
 LABEL org.opencontainers.image.source="https://github.com/dgtlmoon/changedetection.io"
 
+# Install only required runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libxslt1.1 \
-    # For presenting price amounts correctly in the restock/price detection overview
-    locales \
-    # For pdftohtml
-    poppler-utils \
-    zlib1g \
+    libxslt1.1 locales poppler-utils zlib1g \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-
-# https://stackoverflow.com/questions/58701233/docker-logs-erroneously-appears-empty-until-container-stops
+# Ensure logs are not buffered (important for Docker logging)
 ENV PYTHONUNBUFFERED=1
 
-RUN [ ! -d "/datastore" ] && mkdir /datastore
+# Create datastore directory if not exists
+RUN mkdir -p /datastore
 
-# Re #80, sets SECLEVEL=1 in openssl.conf to allow monitoring sites with weak/old cipher suites
+# Set OpenSSL security level to allow old cipher suites
 RUN sed -i 's/^CipherString = .*/CipherString = DEFAULT@SECLEVEL=1/' /etc/ssl/openssl.cnf
 
-# Copy modules over to the final image and add their dir to PYTHONPATH
+# Copy installed dependencies from builder image
 COPY --from=builder /dependencies /usr/local
 ENV PYTHONPATH=/usr/local
 
+# Expose port for the app
 EXPOSE 5000
 
-# The actual flask app module
+# Copy the application source code
 COPY changedetectionio /app/changedetectionio
-# Starting wrapper
 COPY changedetection.py /app/changedetection.py
 
-# Github Action test purpose(test-only.yml).
-# On production, it is effectively LOGGER_LEVEL=''.
+# Environment variable for logging level
 ARG LOGGER_LEVEL=''
 ENV LOGGER_LEVEL "$LOGGER_LEVEL"
 
+# Set working directory
 WORKDIR /app
+
+# Start the application
 CMD ["python", "./changedetection.py", "-d", "/datastore"]
